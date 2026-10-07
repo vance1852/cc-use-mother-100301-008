@@ -8,6 +8,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .energy_service import EnergyService
 from .errors import DomainError, ValidationError
 from .service import DomainService
 from .storage import Database
@@ -48,11 +49,71 @@ def route(service: DomainService, method: str, path: str, body: dict[str, Any] |
             query = parse_qs(parsed.query)
             after = int(query.get("after_sequence", ["0"])[0])
             return 200, {"items": service.audit_events(after)}
+        if isinstance(service, EnergyService):
+            energy = _route_energy(service, method, parsed, body, actor_id)
+            if energy is not None:
+                return energy
         return 404, {"error": "route_not_found", "message": "接口不存在"}
     except DomainError as exc:
         return exc.status, {"error": exc.code, "message": str(exc)}
     except (TypeError, ValueError) as exc:
         return 400, {"error": "invalid_request", "message": str(exc)}
+
+
+def _route_energy(service: EnergyService, method: str, parsed, body: dict[str, Any],
+                  actor_id: str) -> tuple[int, dict[str, Any]] | None:
+    """分派能源承诺与负荷处置接口。"""
+
+    def created(receipt) -> tuple[int, dict[str, Any]]:
+        return 200 if receipt.replayed else 201, receipt.__dict__
+
+    if method == "POST" and parsed.path == "/energy/generators":
+        return created(service.register_generator(actor_id=actor_id, **body))
+    if method == "POST" and parsed.path == "/energy/fuel-batches":
+        return created(service.register_fuel_batch(actor_id=actor_id, **body))
+    if method == "POST" and parsed.path == "/energy/fuel-batches/delay":
+        return created(service.delay_fuel_batch(actor_id=actor_id, **body))
+    if method == "POST" and parsed.path == "/energy/batteries":
+        return created(service.register_battery(actor_id=actor_id, **body))
+    if method == "POST" and parsed.path == "/energy/circuits":
+        return created(service.register_circuit(actor_id=actor_id, **body))
+    if method == "POST" and parsed.path == "/energy/experiment-windows":
+        return created(service.approve_experiment_window(actor_id=actor_id, **body))
+    if method == "POST" and parsed.path == "/energy/overrides":
+        return created(service.request_override(actor_id=actor_id, **body))
+    if method == "POST" and parsed.path == "/energy/overrides/confirm":
+        return created(service.confirm_override(actor_id=actor_id, **body))
+    if method == "POST" and parsed.path == "/energy/plans":
+        return created(service.compute_plan(actor_id=actor_id, **body))
+    if method == "POST" and parsed.path == "/energy/plans/seal":
+        return created(service.seal_plan(actor_id=actor_id, **body))
+    if method == "POST" and parsed.path == "/energy/plans/replan":
+        return created(service.replan(actor_id=actor_id, **body))
+    if method == "POST" and parsed.path == "/energy/telemetry":
+        return created(service.record_telemetry(actor_id=actor_id, **body))
+    if method == "POST" and parsed.path == "/energy/equipment/status":
+        return created(service.report_equipment_status(actor_id=actor_id, **body))
+    if method == "GET" and parsed.path == "/energy/plans":
+        site_id = parse_qs(parsed.query).get("site_id", [""])[0]
+        if not site_id:
+            raise ValidationError("site_id 不能为空")
+        return 200, {"items": service.list_plans(site_id)}
+    if method == "GET" and parsed.path == "/energy/plan-rationale":
+        plan_id = parse_qs(parsed.query).get("plan_id", [""])[0]
+        if not plan_id:
+            raise ValidationError("plan_id 不能为空")
+        return 200, service.get_plan_rationale(plan_id)
+    if method == "GET" and parsed.path == "/energy/dispatch-state":
+        site_id = parse_qs(parsed.query).get("site_id", [""])[0]
+        if not site_id:
+            raise ValidationError("site_id 不能为空")
+        return 200, service.get_dispatch_state(site_id)
+    if method == "GET" and parsed.path == "/energy/energy-account":
+        site_id = parse_qs(parsed.query).get("site_id", [""])[0]
+        if not site_id:
+            raise ValidationError("site_id 不能为空")
+        return 200, service.verify_energy_account(site_id)
+    return None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -99,7 +160,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8080)
     args = parser.parse_args()
     database = Database(args.database)
-    Handler.service = DomainService(database)
+    Handler.service = EnergyService(database)
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     try:
         server.serve_forever()
